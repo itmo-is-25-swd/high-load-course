@@ -29,7 +29,7 @@ class PaymentTransactionsSubscriber {
         subscriptionsManager.createSubscriber(
             PaymentAggregate::class,
             "payments:payment-processings-subscriber",
-            retryConf = RetryConf(1, RetryFailedStrategy.SKIP_EVENT)
+            retryConf = RetryConf(3, RetryFailedStrategy.SKIP_EVENT)
         ) {
             `when`(PaymentProcessedEvent::class) { event ->
                 paymentLog.computeIfAbsent(event.orderId) {

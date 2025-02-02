@@ -53,6 +53,10 @@ class FixedWindowRateLimiter(
     override fun tick() = semaphore.tryAcquire()
 
     fun tickBlocking() = semaphore.acquire()
+
+    fun isAvailable(): Boolean {
+        return semaphore.availablePermits() > 0
+    }
 }
 
 class SlowStartRateLimiter(

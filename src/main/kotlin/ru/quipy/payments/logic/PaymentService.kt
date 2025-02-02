@@ -17,13 +17,13 @@ interface PaymentService {
 
  */
 interface PaymentExternalSystemAdapter {
-    fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+    fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): Boolean
 
     fun name(): String
 
-    fun price(): Int
+    fun isEnabled(deadline: Long): Boolean
 
-    fun isEnabled(): Boolean
+    val price: Int
 }
 
 /**

@@ -7,6 +7,7 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.FixedWindowRateLimiter
+import ru.quipy.common.utils.NonBlockingOngoingWindow
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -34,14 +35,76 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val window = OngoingWindow(parallelRequests)
+    private val window = NonBlockingOngoingWindow(parallelRequests)
     private val rateLimiter = FixedWindowRateLimiter(rateLimitPerSec, 1, TimeUnit.SECONDS)
 
     private val client = OkHttpClient.Builder()
-        .readTimeout(requestAverageProcessingTime)
+        .readTimeout(requestAverageProcessingTime.toMillis() * 5, TimeUnit.MILLISECONDS)
         .build()
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): Boolean {
+        if (!isEnabled(deadline)) {
+            return false
+        }
+
+        val transactionId = createTransaction(paymentId, paymentStartedAt)
+
+        return executeRequest(transactionId, paymentId, amount)
+    }
+
+    private fun executeRequest(transactionId: UUID, paymentId: UUID, amount: Int): Boolean {
+        val body = try {
+            val responseBody = executeRequestSafeWithRetries(transactionId, paymentId, amount)
+            logSuccess(transactionId, paymentId, responseBody)
+
+            responseBody
+        } catch (e: Exception) {
+            when (e) {
+                is SocketTimeoutException -> {
+                    logSocketTimeout(transactionId, paymentId, e)
+                }
+
+                else -> {
+                    logUnknownError(transactionId, paymentId, e)
+                }
+            }
+
+            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+        }
+
+        return body.result
+    }
+
+    private fun logSuccess(
+        transactionId: UUID,
+        paymentId: UUID,
+        body: ExternalSysResponse
+    ) {
+        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+        // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+        // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+        paymentESService.update(paymentId) {
+            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+        }
+    }
+
+    private fun logUnknownError(transactionId: UUID, paymentId: UUID, e: Exception) {
+        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), transactionId, reason = e.message)
+        }
+    }
+
+    private fun logSocketTimeout(transactionId: UUID, paymentId: UUID, e: Exception) {
+        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+        }
+    }
+
+    private fun createTransaction(paymentId: UUID, paymentStartedAt: Long): UUID {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -52,53 +115,22 @@ class PaymentExternalSystemAdapterImpl(
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
-
-        try {
-            val body = executeRequestSafe(transactionId, paymentId, amount)
-
-            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-            // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-            // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-            paymentESService.update(paymentId) {
-                it.logProcessing(body.result, now(), transactionId, reason = body.message)
-            }
-        } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
-                }
-
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
-                }
-            }
-        }
+        return transactionId
     }
 
-    private fun executeRequestSafe(
+    private fun executeRequestSafeWithRetries(
         transactionId: UUID,
         paymentId: UUID,
-        amount: Int
+        amount: Int,
     ): ExternalSysResponse {
-        window.acquire()
-        rateLimiter.tickBlocking()
-
         return try {
-            executeRequest(transactionId, paymentId, amount)
+            executeHttpRequest(transactionId, paymentId, amount)
         } finally {
-            window.release()
+            window.releaseWindow()
         }
     }
 
-    private fun executeRequest(
+    private fun executeHttpRequest(
         transactionId: UUID,
         paymentId: UUID,
         amount: Int
@@ -118,9 +150,26 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    override fun price() = properties.price
+    override val price: Int = properties.price
 
-    override fun isEnabled() = properties.enabled
+    override fun isEnabled(deadline: Long): Boolean {
+        if (deadline <= System.currentTimeMillis() + requestAverageProcessingTime.toMillis()) {
+            return false
+        }
+
+        val windowResult = window.putIntoWindow()
+
+        if (windowResult is NonBlockingOngoingWindow.WindowResponse.Fail) {
+            return false
+        }
+
+        return if (rateLimiter.tick()) {
+            true
+        } else {
+            window.releaseWindow()
+            false
+        }
+    }
 
     override fun name() = properties.accountName
 

@@ -31,7 +31,7 @@ class PaymentSubscriber {
         subscriptionsManager.createSubscriber(
             PaymentAggregate::class,
             "orders:payment-subscriber",
-            retryConf = RetryConf(1, RetryFailedStrategy.SKIP_EVENT),
+            retryConf = RetryConf(3, RetryFailedStrategy.SKIP_EVENT),
         ) {
             `when`(PaymentProcessedEvent::class) { event ->
                 appExecutor.submit {
